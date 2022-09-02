@@ -1,3 +1,4 @@
+from cgitb import text
 import re
 import pickle
 from clean import clean_text
@@ -40,6 +41,7 @@ UNK_TOKEN = "<UNK>"
 
 TO_GPU = torch.cuda.is_available()
 DEVICE = torch.device("cuda" if TO_GPU else "cpu")
+CPU = torch.device("cpu")
 
 
 def is_padding(word):
@@ -160,19 +162,17 @@ class WordEmbedddings:
 
 
 class Corpus(Dataset):
-    def __init__(self, context_size=CONTEXT_SIZE, batch_size=BATCH_SIZE):
-        self.data_folder = "./"
+    def __init__(self, context_size=CONTEXT_SIZE, batch_size=BATCH_SIZE, dummy=False):
+        self.data_folder = "./" if not dummy else "./dummy/"
         self.context_size = context_size
+
         self.batch_size = batch_size
-        (
-            self.train_words,
-            self.validation_words,
-            self.test_words,
-        ) = self.load_all_datasets()
+
+        (self.train_words, self.validation_words, self.test_words,) = (
+            self.load_dummy() if dummy else self.load_all_datasets()
+        )
 
         self.vocab = make_vocab(self.train_words)
-        # print(self.vocab)
-
         self.uniq_words = list(self.vocab)
         self.word_to_index = {word: index for index, word in enumerate(self.uniq_words)}
         self.word_vectors = WordEmbedddings().get_embeddings(self.uniq_words)
@@ -184,10 +184,11 @@ class Corpus(Dataset):
         """
         Load data from file
         """
-        if dataset_type not in ["train", "validation", "test"]:
-            raise ValueError(
-                "dataset_type must be one of ['train', 'validation', 'test']"
-            )
+
+        # if dataset_type not in ["train", "validation", "test"]:
+        #     raise ValueError(
+        #         "dataset_type must be one of ['train', 'validation', 'test']"
+        #     )
 
         data = read_data(f"{self.data_folder}{dataset_type}.txt")
         data = tokenise_and_pad_text(data, self.context_size)
@@ -199,6 +200,13 @@ class Corpus(Dataset):
         return data
 
     def load_all_datasets(self):
+        return (
+            self.load_dataset("train"),
+            self.load_dataset("validation"),
+            self.load_dataset("test"),
+        )
+
+    def load_dummy(self):
         return (
             self.load_dataset("train"),
             self.load_dataset("validation"),
@@ -227,10 +235,12 @@ class Corpus(Dataset):
         return self.word_to_index[word]
 
     def get_word_vectors(self, words):
-        return [self.word_vectors[self.word_to_index[w]] for w in words]
+        return np.mean(
+            np.array([self.word_vectors[self.get_word_index(w)] for w in words]), axis=0
+        )
 
     def __len__(self):
-        return len(self.train_words) - self.context_size + 1
+        return len(self.train_words) - self.context_size
 
     def __getitem__(self, index):
         # ret = (context, word)
@@ -268,52 +278,63 @@ class NNLM(nn.Module):
         self.context_size = context_size
         self.embedding_dim = embedding_dim
 
-        self.layer1 = nn.Sequential(
-            nn.Linear((embedding_dim * context_size), HIDDEN_LAYER_1_SIZE),
-            nn.ReLU(),
+        self.layer = nn.Sequential(
+            nn.Linear(embedding_dim, HIDDEN_LAYER_1_SIZE),
+            # nn.Linear((embedding_dim * context_size), HIDDEN_LAYER_1_SIZE),
+            nn.Tanh(),
             nn.Linear(HIDDEN_LAYER_1_SIZE, HIDDEN_LAYER_2_SIZE),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(HIDDEN_LAYER_2_SIZE, vocab_size),
-            nn.Softmax(dim=1),
+            nn.Softmax(),
         )
 
     def forward(
         self,
         x,
     ):
-        # x = self.embeddings(x).view((self.batch_size, -1))
-        x = x.view((self.batch_size, -1))
+        # x = x.view((self.batch_size, -1))
         return self.layer(x)
 
 
-def get_sentence_perplexity(sent, model, get_word_index):
-    if len(sent) < 1:
-        return -1
+def get_sentence_perplexity(sent, model, dataset):
+    with torch.no_grad():
+        model.eval()
+        model.to(CPU)
+        if len(sent) < 1:
+            return -1
 
-    # sent_prob = 1
-    log_prob = 0
+        # sent_prob = 1
+        log_prob = 0
 
-    sent = add_padding(sent, model.context_size)
+        sent = add_padding(sent, model.context_size)
+        # sent = torch.tensor(dataset.get_word_vectors(sent)).float()
+        for i in range(len(sent) - model.context_size):
 
-    for i in range(len(sent) - model.context_size):
-        pred = model(sent[i : i + model.context_size]).detach().numpy()
-        prediction_prob = pred[get_word_index(sent[i + model.context_size])]
-        log_prob += np.log(prediction_prob)
-        # sent_prob *= prediction_prob
+            pred = model(
+                torch.tensor(
+                    dataset.get_word_vectors(sent[i : i + model.context_size])
+                ).float()
+            ).numpy()
+            # print(pred.shape)
+            pred = pred.T
+            prediction_prob = pred[dataset.get_word_index(sent[i + model.context_size])]
+            log_prob += np.log(prediction_prob)
+            # sent_prob *= prediction_prob
 
-    return np.exp(-log_prob / len(sent))
-    # return (1 / sent_prob) ** (1 / len(sent))
+        # return (1 / sent_prob) ** (1 / len(sent))
+
+        return np.exp(-log_prob / len(sent))
 
 
-def get_text_perplexity(text, model, get_word_index, filepath=None):
+def get_text_perplexity(text, model, dataset, filepath=None):
     # text is list of sentences
 
-    model.eval()
     if len(text) < 1 or len(text[0]) < 1:
         return [-1], -1
 
-    text_pp = [get_sentence_perplexity(sent, model, get_word_index) for sent in text]
+    text_pp = [get_sentence_perplexity(sent, model, dataset) for sent in text]
     avg_pp = sum(text_pp) / len(text_pp)
+    avg_pp = np.mean(avg_pp)
 
     if filepath is not None:
         with open(filepath, "w") as f:
@@ -329,8 +350,6 @@ def train(model, dataset, num_epochs=1):
     Return trained model and avg losses
     """
     logging.info("Training....")
-    model.to(DEVICE)
-    model.train()
 
     min_pp = np.inf
     best_model = 0
@@ -341,8 +360,11 @@ def train(model, dataset, num_epochs=1):
 
     epoch_losses = []
 
+    dims = set()
+
     for epoch in range(num_epochs):
         logging.info(f"EPOCH: {epoch}")
+        model.to(DEVICE)
         model.train()
         losses = []
 
@@ -350,10 +372,14 @@ def train(model, dataset, num_epochs=1):
             if TO_GPU:
                 X = X.to(DEVICE)
                 y = y.to(DEVICE)
+            X = X.float()
+            # y = y.long()
 
             # Prediction
             pred = model(X)
             loss = criterion(pred, y)
+
+            dims.add((X.shape, y.shape, pred.shape))
 
             # Back propagation
             optimizer.zero_grad()
@@ -365,44 +391,41 @@ def train(model, dataset, num_epochs=1):
 
         torch.save(model, f"./model_{epoch}.pth")
 
-        pp = get_text_perplexity(
+        _, pp = get_text_perplexity(
             text=dataset.validation_words,
             model=model,
-            get_word_index=dataset.get_word_index,
+            dataset=dataset,
         )
 
         epoch_losses.append(np.mean(losses))
+
+        print(pp)
 
         if pp < min_pp:
             min_pp = pp
             best_model = epoch
 
-    logging.info("Best model: {best_model}")
-    logging.info("Min perplexity: {min_pp}")
+    logging.info(f"Best model: {best_model}")
+    logging.info(f"Min perplexity: {min_pp}")
+
+    print(f"Dimensions: ", dims)
 
     model = torch.load(f"./model_{best_model}.pth")
     return model, epoch_losses
 
 
 def make_pp_files(model, dataset):
-    get_text_perplexity(
-        text=dataset.train_words,
-        model=model,
-        get_word_index=dataset.get_word_index,
-        filepath="./2019115003-LM1-train-perplexity.txt",
-    )
-    get_text_perplexity(
-        text=dataset.validation_words,
-        model=model,
-        get_word_index=dataset.get_word_index,
-        filepath="./2019115003-LM1-validation-perplexity.txt",
-    )
-    get_text_perplexity(
-        text=dataset.test_words,
-        model=model,
-        get_word_index=dataset.get_word_index,
-        filepath="./2019115003-LM1-test-perplexity.txt",
-    )
+    names = ["test", "validation", "train"]
+    for name in names:
+        data = read_data(f"{name}.txt")
+        data = tokenise_and_pad_text(data, model.context_size)
+
+        get_text_perplexity(
+            text=data,
+            model=model,
+            dataset=dataset,
+            filepath=f"./2019115003-LM1-{name}-perplexity.txt",
+        )
 
 
 def load_stored_files(model_path, dataset_path):
@@ -420,11 +443,7 @@ if __name__ == "__main__":
         model, dataset = load_stored_files("model_0.pth", "brown_corpus.pkl")
         x = input("Enter a sentence: ").strip()
 
-        print(
-            get_sentence_perplexity(
-                tokenise_and_pad_text(x), model, dataset.get_word_index
-            )
-        )
+        print(get_sentence_perplexity(tokenise_and_pad_text(x), model, dataset))
     # elif x == "train":
     else:
         logging.info("Loading Corpus....")
@@ -432,9 +451,7 @@ if __name__ == "__main__":
         logging.info("Loading Model....")
         model = NNLM(vocab_size=len(corpus.vocab))
         model, losses = train(model, corpus)
-        # logging.info("Losses are:")
-        # logging.info(losses)
         print(losses)
+        # if x == "make":
         logging.info("Making pp files.....")
-
         make_pp_files(model, corpus)
