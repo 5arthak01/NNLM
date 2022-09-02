@@ -16,7 +16,11 @@ from gensim.models import KeyedVectors
 # from gensim.models import Word2Vec
 # import gensim.models.KeyedVectors.load_word2vec_format as load_word2vec_format
 # from gensim.scripts.glove2word2vec import glove2word2vec
+import logging
 
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%I:%M:%S %p"
+)
 
 BATCH_SIZE = 128
 MAX_UNK_FREQ = 2
@@ -75,9 +79,8 @@ def make_vocab(data):
     """
     # data = read_data(filename)
     # data = tokenise(data)
-    vocab = [word for line in data for word in line]
-    vocab = Counter(vocab)
-    # vocab = sorted(vocab, key=vocab.get, reverse=True)
+    # data = [word for line in data for word in line]
+    vocab = Counter(data)
     return vocab
 
 
@@ -87,6 +90,14 @@ def tokenise_and_pad_text(data, context_size=CONTEXT_SIZE):
     """
     data = tokenise(data)
     data = [add_padding(line, context_size) for line in data]
+    return data
+
+
+def unravel_data(data):
+    """
+    Unravel data into list of words
+    """
+    data = [word for line in data for word in line]
     return data
 
 
@@ -101,15 +112,17 @@ class WordEmbedddings:
             else "glove-wiki-gigaword-50"
         )
 
-        if download:
-            self.embeddings = self.download_pretrained()
-        else:
-            if emedding_type == "w2v":
-                self.embeddings = KeyedVectors.load_word2vec_format(self.model_path)
-            # else:
-            #     self.embeddings = gensim.models.KeyedVectors.load(
-            #         f"{self.emedding_type}_model.pth"
-            #     )
+        self.embeddings = gensim_downloader.load(self.model_name)
+
+        # if download:
+        #     self.embeddings = self.download_pretrained()
+        # else:
+        #     if emedding_type == "w2v":
+        #         self.embeddings = KeyedVectors.load_word2vec_format(self.model_path)
+        #     # else:
+        #     #     self.embeddings = gensim.models.KeyedVectors.load(
+        #     #         f"{self.emedding_type}_model.pth"
+        #     #     )
 
         self.embedding_size = EMBEDDING_DIM
 
@@ -156,12 +169,16 @@ class Corpus(Dataset):
             self.validation_words,
             self.test_words,
         ) = self.load_all_datasets()
+
         self.vocab = make_vocab(self.train_words)
-        self.uniq_words = sorted(self.vocab, key=self.vocab.get, reverse=True)
+        # print(self.vocab)
+
+        self.uniq_words = list(self.vocab)
         self.word_to_index = {word: index for index, word in enumerate(self.uniq_words)}
+        self.word_vectors = WordEmbedddings().get_embeddings(self.uniq_words)
+
         # self.train_words_as_inds = [self.word_to_index[w] for w in self.train_words]
         # self.index_to_word = {index: word for index, word in enumerate(self.uniq_words)}
-        self.word_vectors = WordEmbedddings().get_embeddings(self.uniq_words)
 
     def load_dataset(self, dataset_type="train"):
         """
@@ -176,6 +193,7 @@ class Corpus(Dataset):
         data = tokenise_and_pad_text(data, self.context_size)
 
         if dataset_type == "train":
+            data = unravel_data(data)
             data = self.replace_with_unk(data)
 
         return data
@@ -187,14 +205,12 @@ class Corpus(Dataset):
             self.load_dataset("test"),
         )
 
-    def replace_with_unk(self, data):
-        vocab = make_vocab(data)
+    def replace_with_unk(self, words):
+        # words is a list of words
+        vocab = make_vocab(words)
 
-        data = [
-            [x if vocab.get(x, 0) > MAX_UNK_FREQ else UNK_TOKEN for x in line]
-            for line in data
-        ]
-        return data
+        words = [x if vocab.get(x, 0) > MAX_UNK_FREQ else UNK_TOKEN for x in words]
+        return words
 
     def get_word_onehot(self, word):
         """
@@ -308,11 +324,14 @@ def get_text_perplexity(text, model, get_word_index, filepath=None):
     return text_pp, avg_pp
 
 
-def train(dataset, model, num_epochs=1):
+def train(model, dataset, num_epochs=1):
     """
     Return trained model and avg losses
     """
+    logging.info("Training....")
+    model.to(DEVICE)
     model.train()
+
     min_pp = np.inf
     best_model = 0
 
@@ -323,7 +342,7 @@ def train(dataset, model, num_epochs=1):
     epoch_losses = []
 
     for epoch in range(num_epochs):
-        print("EPOCH: ", epoch)
+        logging.info(f"EPOCH: {epoch}")
         model.train()
         losses = []
 
@@ -358,8 +377,8 @@ def train(dataset, model, num_epochs=1):
             min_pp = pp
             best_model = epoch
 
-    print("Best model: ", best_model)
-    print("Min perplexity: ", min_pp)
+    logging.info("Best model: {best_model}")
+    logging.info("Min perplexity: {min_pp}")
 
     model = torch.load(f"./model_{best_model}.pth")
     return model, epoch_losses
@@ -394,7 +413,8 @@ def load_stored_files(model_path, dataset_path):
 
 
 if __name__ == "__main__":
-    x = input("To get perplexity of a sentence, enter 1\n").strip()
+    # x = input("To get perplexity of a sentence, enter 1\n").strip()
+    x = "train"
     if x == "1":
         print("Loading....")
         model, dataset = load_stored_files("model_0.pth", "brown_corpus.pkl")
@@ -407,8 +427,14 @@ if __name__ == "__main__":
         )
     # elif x == "train":
     else:
+        logging.info("Loading Corpus....")
         corpus = Corpus()
-        model = NNLM()
-        rets = train(model, corpus)
-        for x in rets:
-            print(x)
+        logging.info("Loading Model....")
+        model = NNLM(vocab_size=len(corpus.vocab))
+        model, losses = train(model, corpus)
+        # logging.info("Losses are:")
+        # logging.info(losses)
+        print(losses)
+        logging.info("Making pp files.....")
+
+        make_pp_files(model, corpus)
