@@ -1,4 +1,3 @@
-from cgitb import text
 import re
 import pickle
 from clean import clean_text
@@ -177,18 +176,10 @@ class Corpus(Dataset):
         self.word_to_index = {word: index for index, word in enumerate(self.uniq_words)}
         self.word_vectors = WordEmbedddings().get_embeddings(self.uniq_words)
 
-        # self.train_words_as_inds = [self.word_to_index[w] for w in self.train_words]
-        # self.index_to_word = {index: word for index, word in enumerate(self.uniq_words)}
-
     def load_dataset(self, dataset_type="train"):
         """
         Load data from file
         """
-
-        # if dataset_type not in ["train", "validation", "test"]:
-        #     raise ValueError(
-        #         "dataset_type must be one of ['train', 'validation', 'test']"
-        #     )
 
         data = read_data(f"{self.data_folder}{dataset_type}.txt")
         data = tokenise_and_pad_text(data, self.context_size)
@@ -271,9 +262,6 @@ class NNLM(nn.Module):
         batch_size=BATCH_SIZE,
     ):
         super(NNLM, self).__init__()
-
-        # self.embeddings = nn.Embedding(vocab_size, embedding_dim)
-        # self.embeddings.weight.data.uniform_(0, 1)
         self.batch_size = batch_size
         self.context_size = context_size
         self.embedding_dim = embedding_dim
@@ -292,16 +280,59 @@ class NNLM(nn.Module):
         self,
         x,
     ):
-        # x = x.view((self.batch_size, -1))
         return self.layer(x)
 
 
-def get_sentence_perplexity(sent, model, dataset):
+class RNNLM(nn.Module):
+    def __init__(
+        self,
+        vocab_size,
+        embedding_dim=EMBEDDING_DIM,
+        context_size=CONTEXT_SIZE,
+        batch_size=BATCH_SIZE,
+    ):
+        super(RNNLM, self).__init__()
+        self.batch_size = batch_size
+        self.context_size = context_size
+        self.embedding_dim = embedding_dim
+
+        self.make_hidden = nn.Sequential(
+            nn.Linear(EMBEDDING_DIM + HIDDEN_LAYER_1_SIZE, HIDDEN_LAYER_1_SIZE),
+            nn.Tanh(),
+        )
+
+        self.make_op = nn.Sequential(
+            nn.Linear(EMBEDDING_DIM + HIDDEN_LAYER_1_SIZE, HIDDEN_LAYER_2_SIZE),
+            nn.Tanh(),
+            nn.Linear(HIDDEN_LAYER_2_SIZE, vocab_size),
+            nn.Softmax(),
+        )
+
+    def forward(self, x, hidden_state):
+        try:
+            combined = torch.cat((x, hidden_state), 1)
+        except:
+            x = torch.reshape(x, (-1, EMBEDDING_DIM))
+            hidden_state = torch.reshape(hidden_state, (-1, HIDDEN_LAYER_1_SIZE))
+            combined = torch.cat((x, hidden_state), 1)
+
+        return self.make_op(combined), self.make_hidden(combined)
+
+    def init_hidden(self, dimension=None):
+        if dimension is None:
+            dimension = self.batch_size
+        return torch.zeros(dimension, HIDDEN_LAYER_1_SIZE)
+
+
+def get_sentence_perplexity(sent, model, dataset, rnn=False):
+    if len(sent) < 1:
+        return -1
     with torch.no_grad():
         model.eval()
         model.to(CPU)
-        if len(sent) < 1:
-            return -1
+
+        if rnn:
+            hidden_state = model.init_hidden(dimension=1)
 
         # sent_prob = 1
         log_prob = 0
@@ -309,38 +340,47 @@ def get_sentence_perplexity(sent, model, dataset):
         sent = add_padding(sent, model.context_size)
         # sent = torch.tensor(dataset.get_word_vectors(sent)).float()
         for i in range(len(sent) - model.context_size):
-
-            pred = model(
-                torch.tensor(
-                    dataset.get_word_vectors(sent[i : i + model.context_size])
-                ).float()
-            ).numpy()
-            # print(pred.shape)
+            if rnn:
+                pred, hidden_state = model(
+                    torch.tensor(
+                        dataset.get_word_vectors(sent[i : i + model.context_size])
+                    ).float(),
+                    hidden_state,
+                )
+                hidden_state = hidden_state.detach()
+            else:
+                pred = model(
+                    torch.tensor(
+                        dataset.get_word_vectors(sent[i : i + model.context_size])
+                    ).float()
+                ).numpy()
             pred = pred.T
             prediction_prob = pred[dataset.get_word_index(sent[i + model.context_size])]
             log_prob += np.log(prediction_prob)
             # sent_prob *= prediction_prob
 
         # return (1 / sent_prob) ** (1 / len(sent))
-
         return np.exp(-log_prob / len(sent))
 
 
-def get_text_perplexity(text, model, dataset, filepath=None):
+def get_text_perplexity(text, model, dataset, filepath=None, rnn=False):
     # text is list of sentences
 
     if len(text) < 1 or len(text[0]) < 1:
         return [-1], -1
 
-    text_pp = [get_sentence_perplexity(sent, model, dataset) for sent in text]
+    text_pp = [get_sentence_perplexity(sent, model, dataset, rnn) for sent in text]
     avg_pp = sum(text_pp) / len(text_pp)
-    avg_pp = np.mean(avg_pp)
-
+    # avg_pp = np.mean(avg_pp)
     if filepath is not None:
         with open(filepath, "w") as f:
-            for i in range(len(text)):
-                f.write(f"{text[i]}\t{text_pp[i]:.3f}\n")
-            f.write(f"{avg_pp:.3f}\n")
+            try:
+                for i in range(len(text)):
+                    f.write(f"{text[i]}\t{text_pp[i]:.3f}\n")
+                f.write(f"{avg_pp:.3f}\n")
+            except:
+                print(type(text[i]), text[i])
+                print(type(text_pp[i]), text_pp[i])
 
     return text_pp, avg_pp
 
@@ -414,7 +454,76 @@ def train(model, dataset, num_epochs=1):
     return model, epoch_losses
 
 
-def make_pp_files(model, dataset):
+def train_rnn(model: RNNLM, dataset, num_epochs=1):
+    """
+    Return trained model and avg losses
+    """
+    logging.info("Training....")
+
+    min_pp = np.inf
+    best_model = 0
+
+    dataloader = DataLoader(dataset, batch_size=model.batch_size)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    epoch_losses = []
+
+    for epoch in range(num_epochs):
+        logging.info(f"EPOCH: {epoch}")
+        model.to(DEVICE)
+        model.train()
+        losses = []
+        hidden_state = model.init_hidden().to(DEVICE)
+
+        for _, (X, y) in enumerate(dataloader):
+            if TO_GPU:
+                X = X.to(DEVICE)
+                y = y.to(DEVICE)
+            X = X.float()
+            # y = y.long()
+
+            # clear gradients
+            optimizer.zero_grad()
+
+            # Prediction
+            pred, hidden_state = model(X, hidden_state)
+            hidden_state = hidden_state.detach()
+
+            loss = criterion(pred, y)
+
+            # Back propagation
+            loss.backward()
+
+            # GD step
+            optimizer.step()
+            losses.append(loss.item())
+
+        torch.save(model, f"./rnnmodel_{epoch}.pth")
+
+        _, pp = get_text_perplexity(
+            text=dataset.validation_words,
+            model=model,
+            dataset=dataset,
+            rnn=True,
+        )
+
+        epoch_losses.append(np.mean(losses))
+
+        print(pp)
+
+        if pp < min_pp:
+            min_pp = pp
+            best_model = epoch
+
+    logging.info(f"Best model: {best_model}")
+    logging.info(f"Min perplexity: {min_pp}")
+
+    model = torch.load(f"./rnnmodel_{best_model}.pth")
+    return model, epoch_losses
+
+
+def make_pp_files(model, dataset, model_number=1, rnn=False):
     names = ["test", "validation", "train"]
     for name in names:
         data = read_data(f"{name}.txt")
@@ -424,7 +533,8 @@ def make_pp_files(model, dataset):
             text=data,
             model=model,
             dataset=dataset,
-            filepath=f"./2019115003-LM1-{name}-perplexity.txt",
+            rnn=rnn,
+            filepath=f"./2019115003-LM{model_number}-{name}-perplexity.txt",
         )
 
 
@@ -436,22 +546,54 @@ def load_stored_files(model_path, dataset_path):
 
 
 if __name__ == "__main__":
-    # x = input("To get perplexity of a sentence, enter 1\n").strip()
-    x = "train"
-    if x == "1":
-        print("Loading....")
-        model, dataset = load_stored_files("model_0.pth", "brown_corpus.pkl")
-        x = input("Enter a sentence: ").strip()
 
-        print(get_sentence_perplexity(tokenise_and_pad_text(x), model, dataset))
-    # elif x == "train":
-    else:
+    prompt = """
+    Enter:
+    1 - to get perplexity of an input sentence
+    2 - to train NNLM and make pp files
+    3 - to train RNNLM and make pp files
+    4 - to load stored model and dataset and make pp files
+    """
+
+    x = input(prompt).strip()
+    # x = "train"
+    if x == "1":
         logging.info("Loading Corpus....")
         corpus = Corpus()
+
+        x = input("Enter 1 for NNLM or 2 if you want RNN model").strip()
         logging.info("Loading Model....")
+        model = torch.load("model_0.pth") if x == "1" else torch.load("rnnmodel_0.pth")
+
+        x = input("Enter a sentence: ").strip()
+
+        print(get_sentence_perplexity(tokenise(x), model, corpus, rnn=x == "2"))
+    elif x == "2":
+        logging.info("Loading Corpus....")
+        corpus = Corpus()
+        logging.info("Loading NNLM Model....")
         model = NNLM(vocab_size=len(corpus.vocab))
         model, losses = train(model, corpus)
         print(losses)
         # if x == "make":
         logging.info("Making pp files.....")
-        make_pp_files(model, corpus)
+        make_pp_files(model, corpus, 1)
+    elif x == "3":
+        logging.info("Loading Corpus....")
+        corpus = Corpus()
+        logging.info("Loading RNNLM Model....")
+        model = RNNLM(vocab_size=len(corpus.vocab))
+        model, losses = train_rnn(model, corpus)
+        print(losses)
+        logging.info("Making pp files.....")
+        make_pp_files(model, corpus, 2, rnn=True)
+    else:
+        logging.info("Loading Corpus....")
+        corpus = Corpus()
+
+        x = input("Enter 1 for NNLM or 2 if you want RNN model").strip()
+        logging.info("Loading Model....")
+        model = torch.load("model_0.pth") if x == "1" else torch.load("rnnmodel_0.pth")
+
+        logging.info("Making pp files.....")
+        make_pp_files(model, corpus, x, rnn=x == "2")
